@@ -73,11 +73,6 @@ pub enum RbacError {
 
 // ── Core helpers ──────────────────────────────────────────────────────────
 
-/// Whether `account` currently holds the role identified by `role_key`.
-///
-/// `role_key` is the composite `(role, account)` key used to test membership
-/// — typically `DataKey::Role(RoleKey { role, account })`.
-
 /// Role assignment tracking optional expiration timestamp (Issue #692).
 #[soroban_sdk::contracttype]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -85,6 +80,10 @@ pub struct RoleAssignment {
     pub expires_at: Option<u64>,
 }
 
+/// Whether `account` currently holds the role identified by `role_key`.
+///
+/// `role_key` is the composite `(role, account)` key used to test membership
+/// — typically `DataKey::Role(RoleKey { role, account })`.
 pub fn has_role<RK: StorageKey>(env: &Env, role_key: &RK) -> bool {
     let assignment: Option<RoleAssignment> = env.storage().instance().get(role_key);
     match assignment {
@@ -304,7 +303,7 @@ pub fn require_role<RK: StorageKey>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use soroban_sdk::testutils::Address as _;
+    use soroban_sdk::testutils::{Address as _, Ledger as _};
     use soroban_sdk::{contract, contractimpl, contracttype, symbol_short};
 
     // ── Contract frame ────────────────────────────────────────────────────────
