@@ -69,6 +69,7 @@ pub struct RoleKey {
 pub enum DataKey {
     Admin,
     Config,
+    QuoteCurrency,
     Price,
     Role(RoleKey),
     AdminCount,
@@ -147,6 +148,20 @@ pub struct OracleConfig {
     /// configured value is exposed on-chain via [`TwapOracle::min_submitters`]
     /// so callers can check the reliability threshold before trusting a price.
     pub min_submitters: u32,
+}
+
+/// Optional field-wise changes to oracle configuration. `None` preserves the
+/// currently stored value, avoiding a client-side read-modify-write race.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OracleConfigUpdate {
+    pub decimals: Option<u32>,
+    pub asset_peg: Option<u32>,
+    pub max_staleness: Option<u64>,
+    pub max_price: Option<u64>,
+    pub min_submit_interval: Option<u64>,
+    pub min_submitters: Option<u32>,
+    pub quote_currency: Option<soroban_sdk::Symbol>,
 }
 
 #[contracttype]
@@ -283,6 +298,17 @@ impl TwapOracle {
         role_members(&env, role)
     }
 
+    /// Returns addresses with tracked price submissions, including stale
+    /// submissions. This is the exact roster targeted by `purge_submitter`;
+    /// `role_members(Role::PriceFeeder)` instead lists authorized feeders,
+    /// including those who have never submitted a price.
+    pub fn submitters(env: Env) -> Vec<Address> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Submitters)
+            .unwrap_or(Vec::new(&env))
+    }
+
     /// Grants `role` to `account`. Only an `Admin` may call this.
     pub fn grant_role(
         env: Env,
@@ -319,7 +345,9 @@ impl TwapOracle {
     }
 
     /// Explicitly purges a feeder's submission data and removes them from the
-    /// submitters set. Only an `Admin` may call this.
+    /// submitters set. Use `submitters()` to enumerate the tracked roster;
+    /// `role_members(Role::PriceFeeder)` lists authorized feeders instead.
+    /// Only an `Admin` may call this.
     pub fn purge_submitter(env: Env, caller: Address, feeder: Address) -> Result<(), Error> {
         require_role_or_admin(&env, &caller, Role::Admin)?;
         bump_instance(&env);
@@ -346,7 +374,7 @@ impl TwapOracle {
 
     // ── Reads ────────────────────────────────────────────────────────────
 
-    /// Reconfigures oracle parameters and pricing settings. Admin-gated.
+    /// Replaces all oracle parameters and pricing settings. Admin-gated.
     ///
     /// # Authorization
     ///
@@ -397,52 +425,66 @@ impl TwapOracle {
     ///   exceeds [`MAX_SUBMITTERS`].
     pub fn configure_oracle(env: Env, caller: Address, config: OracleConfig) -> Result<(), Error> {
         require_role_or_admin(&env, &caller, Role::Admin)?;
+        store_oracle_config(&env, &caller, config)
+    }
 
-        if config.decimals > 19 {
-            return Err(Error::InvalidDecimals);
+    /// Returns the complete stored oracle configuration.
+    pub fn oracle_config(env: Env) -> Result<OracleConfig, Error> {
+        env.storage()
+            .instance()
+            .get(&DataKey::Config)
+            .ok_or(Error::OracleNotConfigured)
+    }
+
+    /// Applies only the supplied fields; all omitted fields retain their
+    /// current values. Configuration validation and price-cache invalidation
+    /// are identical to `configure_oracle`.
+    pub fn update_oracle_config(
+        env: Env,
+        caller: Address,
+        update: OracleConfigUpdate,
+    ) -> Result<(), Error> {
+        require_role_or_admin(&env, &caller, Role::Admin)?;
+        let mut config: OracleConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::Config)
+            .ok_or(Error::OracleNotConfigured)?;
+
+        if let Some(value) = update.decimals {
+            config.decimals = value;
+        }
+        if let Some(value) = update.asset_peg {
+            config.asset_peg = value;
+        }
+        if let Some(value) = update.max_staleness {
+            config.max_staleness = value;
+        }
+        if let Some(value) = update.max_price {
+            config.max_price = value;
+        }
+        if let Some(value) = update.min_submit_interval {
+            config.min_submit_interval = value;
+        }
+        if let Some(value) = update.min_submitters {
+            config.min_submitters = value;
         }
 
-        if config.max_staleness == 0 {
-            return Err(Error::InvalidMaxStaleness);
+        let quote_currency = update.quote_currency;
+        store_oracle_config(&env, &caller, config)?;
+        if let Some(currency) = quote_currency {
+            env.storage()
+                .instance()
+                .set(&DataKey::QuoteCurrency, &currency);
+            events::quote_currency_configured(&env, &caller, currency);
         }
-
-        // The quorum must be at least one (a zero-feeder quorum would let the
-        // oracle report prices nobody backs) and can never exceed the capped
-        // submitter set aggregation iterates over (issue #661).
-        if config.min_submitters == 0 || config.min_submitters > MAX_SUBMITTERS {
-            return Err(Error::InvalidMinSubmitters);
-        }
-
-        bump_instance(&env);
-
-        // Check if decimals or asset_peg changed relative to existing config.
-        // If so, clear all stored price data to prevent magnitude misinterpretation.
-        let existing: Option<OracleConfig> = env.storage().instance().get(&DataKey::Config);
-        if let Some(old) = existing {
-            if old.decimals != config.decimals || old.asset_peg != config.asset_peg {
-                // Clear the legacy single-value price slot.
-                env.storage().instance().remove(&DataKey::Price);
-
-                // Clear every per-feeder submission and the submitter list itself.
-                // Submissions live in persistent() (see DataKey docs) so clears
-                // must target persistent storage and respect the cap.
-                let submitters: Vec<Address> = env
-                    .storage()
-                    .persistent()
-                    .get(&DataKey::Submitters)
-                    .unwrap_or(Vec::new(&env));
-                for feeder in submitters.iter() {
-                    env.storage()
-                        .persistent()
-                        .remove(&DataKey::Submission(feeder));
-                }
-                env.storage().persistent().remove(&DataKey::Submitters);
-            }
-        }
-
-        env.storage().instance().set(&DataKey::Config, &config);
-        events::oracle_configured(&env, &caller, config);
         Ok(())
+    }
+
+    /// Returns the denomination configured for fiat payout values, or `None`
+    /// until an admin supplies it through `update_oracle_config`.
+    pub fn quote_currency(env: Env) -> Option<soroban_sdk::Symbol> {
+        env.storage().instance().get(&DataKey::QuoteCurrency)
     }
 
     /// Submit a price observation. Gated strictly on `PriceFeeder` — `Admin`
@@ -616,7 +658,7 @@ impl TwapOracle {
         // from fewer fresh feeders than `min_submitters` is not reliable
         // enough to return. `PriceStatus` exposes both counts so callers can
         // observe how far below quorum the set is.
-        if fresh_prices.len() as u32 < config.min_submitters {
+        if (fresh_prices.len() as u32) < config.min_submitters {
             return Err(Error::InsufficientQuorum);
         }
 
@@ -656,6 +698,9 @@ impl TwapOracle {
     /// Errors:
     /// - `OracleNotConfigured` if `configure_oracle` has not been called.
     /// - `NoPriceAvailable` if no price has ever been submitted.
+    ///
+    /// Use this single view when both age and staleness are needed; it bundles
+    /// `newest_age`, `oldest_fresh_age`, `stale`, and quorum counts together.
     pub fn price_status(env: Env) -> Result<PriceStatus, Error> {
         load_price_status(&env)
     }
@@ -807,6 +852,45 @@ impl TwapOracle {
     }
 }
 
+fn store_oracle_config(env: &Env, caller: &Address, config: OracleConfig) -> Result<(), Error> {
+    if config.decimals > 19 {
+        return Err(Error::InvalidDecimals);
+    }
+
+    if config.max_staleness == 0 {
+        return Err(Error::InvalidMaxStaleness);
+    }
+
+    if config.min_submitters == 0 || config.min_submitters > MAX_SUBMITTERS {
+        return Err(Error::InvalidMinSubmitters);
+    }
+
+    bump_instance(env);
+
+    let existing: Option<OracleConfig> = env.storage().instance().get(&DataKey::Config);
+    if let Some(old) = existing {
+        if old.decimals != config.decimals || old.asset_peg != config.asset_peg {
+            env.storage().instance().remove(&DataKey::Price);
+
+            let submitters: Vec<Address> = env
+                .storage()
+                .persistent()
+                .get(&DataKey::Submitters)
+                .unwrap_or(Vec::new(env));
+            for feeder in submitters.iter() {
+                env.storage()
+                    .persistent()
+                    .remove(&DataKey::Submission(feeder));
+            }
+            env.storage().persistent().remove(&DataKey::Submitters);
+        }
+    }
+
+    env.storage().instance().set(&DataKey::Config, &config);
+    events::oracle_configured(env, caller, config);
+    Ok(())
+}
+
 // ── Internal RBAC helpers (delegate to drip_common::rbac) ─────────────────
 //
 // These thin wrappers translate the oracle's DataKey / Role types into the
@@ -912,6 +996,7 @@ fn add_submitter(env: &Env, account: &Address) -> Result<(), Error> {
 
     for existing in submitters.iter() {
         if existing == *account {
+            ttl::bump_persistent(env, &DataKey::Submitters);
             return Ok(());
         }
     }
@@ -1187,6 +1272,11 @@ mod events {
     pub fn oracle_configured(env: &Env, caller: &Address, config: super::OracleConfig) {
         env.events()
             .publish((symbol_short!("ocfg"), caller.clone()), config);
+    }
+
+    pub fn quote_currency_configured(env: &Env, caller: &Address, currency: soroban_sdk::Symbol) {
+        env.events()
+            .publish((symbol_short!("qcurr"), caller.clone()), currency);
     }
 
     /// Emitted when a price submission is rejected so off-chain monitors
