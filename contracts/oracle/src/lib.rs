@@ -21,6 +21,11 @@ pub const PRICE_PRECISION: u128 = 100_000_000;
 
 const MAX_SUBMITTERS: u32 = 32;
 
+/// Maximum number of reporters retained for any one pair feed.
+const MAX_PAIR_REPORTERS: u32 = 5;
+/// Pair reports older than 15 minutes never participate in the median.
+const PAIR_REPORT_FRESHNESS_SECS: u64 = 15 * 60;
+
 /// Extends the instance storage TTL so the oracle's entries
 /// (`DataKey::Admin`, `DataKey::Config`, `DataKey::Price`, etc.) never silently
 /// archive during idle periods. Called from every state-mutating entry point.
@@ -98,10 +103,20 @@ pub enum DataKey {
     /// `DripGovernor::DataKey::RoleMembers`, closing the gap noted in the
     /// off-chain tooling audit.
     RoleMembers(Role),
-    /// Direct pair price by token Address (base, quote).
+    /// Legacy/latest direct pair price by token Address (base, quote).
+    /// New reads aggregate timestamped per-reporter submissions, but this
+    /// scalar remains as an upgrade fallback for pre-aggregation deployments.
     PairPrice(Address, Address),
-    /// Direct pair price by Symbol (base, quote).
+    /// Timestamped pair report keyed by (base, quote, reporter).
+    PairSubmission(Address, Address, Address),
+    /// Bounded reporter index for one Address pair.
+    PairReporters(Address, Address),
+    /// Legacy/latest direct pair price by Symbol (base, quote).
     PairPriceSymbol(Symbol, Symbol),
+    /// Timestamped symbol-pair report keyed by (base, quote, reporter).
+    PairSymbolSubmission(Symbol, Symbol, Address),
+    /// Bounded reporter index for one Symbol pair.
+    PairSymbolReporters(Symbol, Symbol),
 }
 
 /// Configuration parameters for the TWAP oracle.
@@ -176,6 +191,13 @@ pub struct OracleConfigUpdate {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PriceData {
     pub price: u64,
+    pub updated_at: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PairPriceData {
+    pub price: u128,
     pub updated_at: u64,
 }
 
@@ -266,6 +288,8 @@ pub enum Error {
     InvalidWasmHash = 1021,
     /// Price feed not found for requested pair.
     PriceNotFound = 1022,
+    /// A pair already has the maximum five active reporters.
+    TooManyPairReporters = 1023,
 }
 
 #[contract]
@@ -668,7 +692,7 @@ impl TwapOracle {
         // from fewer fresh feeders than `min_submitters` is not reliable
         // enough to return. `PriceStatus` exposes both counts so callers can
         // observe how far below quorum the set is.
-        if (fresh_prices.len() as u32) < config.min_submitters {
+        if fresh_prices.len() < config.min_submitters {
             return Err(Error::InsufficientQuorum);
         }
 
@@ -818,10 +842,11 @@ impl TwapOracle {
         Ok(value as u64)
     }
 
-    /// Sets the price for a token pair (base/quote) identified by `Address`.
+    /// Submit a price report for a token pair (base/quote) identified by `Address`.
     ///
-    /// Requires that caller is an authorized PriceFeeder or Admin, and that
-    /// the oracle is not paused. Rejects zero price with [`Error::InvalidPrice`].
+    /// Up to five authorized reporters are tracked per pair. `get_price`
+    /// returns the median of reports no older than 15 minutes, preventing one
+    /// reporter from unilaterally setting the pair price.
     pub fn set_price(
         env: Env,
         caller: Address,
@@ -834,59 +859,69 @@ impl TwapOracle {
         if price == 0 {
             return Err(Error::InvalidPrice);
         }
+
         bump_instance(&env);
+        add_pair_reporter(&env, &base, &quote, &caller)?;
+
+        let data = PairPriceData {
+            price,
+            updated_at: env.ledger().timestamp(),
+        };
+        let submission_key = DataKey::PairSubmission(base.clone(), quote.clone(), caller.clone());
+        env.storage().persistent().set(&submission_key, &data);
+        ttl::bump_persistent(&env, &submission_key);
+
+        // Keep the historical scalar populated for upgrade compatibility. New
+        // reads prefer the timestamped reporter set above.
         env.storage()
             .instance()
             .set(&DataKey::PairPrice(base, quote), &price);
         Ok(())
     }
 
-    /// Fetches the direct price for a token pair (base/quote) identified by `Address`.
+    /// Returns the decentralized median price for an Address pair.
     ///
-    /// Returns [`Error::PriceNotFound`] if no direct feed exists.
+    /// Only reports submitted within the last 15 minutes by reporters that
+    /// remain authorized are included. If a contract predates pair-report
+    /// aggregation and has no reporter index yet, the legacy scalar is
+    /// returned as a migration fallback.
     pub fn get_price(env: Env, base: Address, quote: Address) -> Result<u128, Error> {
-        env.storage()
-            .instance()
-            .get(&DataKey::PairPrice(base, quote))
-            .ok_or(Error::PriceNotFound)
+        aggregate_pair_price(&env, &base, &quote)
     }
 
-    /// Fetches the inverted price for a token pair (base/quote) identified by `Address`.
-    ///
-    /// Returns the direct feed price if found; otherwise, if the reciprocal
-    /// feed (quote/base) is found, calculates and returns:
-    /// `(PRICE_PRECISION^2 / price)`
-    /// Returns [`Error::PriceNotFound`] if neither feed exists.
+    /// Fetches the direct pair median, or the reciprocal median for the reverse pair.
     pub fn get_price_inverted(env: Env, base: Address, quote: Address) -> Result<u128, Error> {
-        if let Some(price) = env
-            .storage()
-            .instance()
-            .get::<_, u128>(&DataKey::PairPrice(base.clone(), quote.clone()))
-        {
-            return Ok(price);
-        }
+        let direct_err = match aggregate_pair_price(&env, &base, &quote) {
+            Ok(price) => return Ok(price),
+            Err(err @ Error::PriceNotFound) | Err(err @ Error::OracleStalePrice) => err,
+            Err(err) => return Err(err),
+        };
 
-        if let Some(price) = env
-            .storage()
-            .instance()
-            .get::<_, u128>(&DataKey::PairPrice(quote, base))
-        {
-            if price == 0 {
-                return Err(Error::InvalidPrice);
+        match aggregate_pair_price(&env, &quote, &base) {
+            Ok(price) => {
+                if price == 0 {
+                    return Err(Error::InvalidPrice);
+                }
+                let precision_sq = PRICE_PRECISION
+                    .checked_mul(PRICE_PRECISION)
+                    .ok_or(Error::ArithmeticOverflow)?;
+                precision_sq
+                    .checked_div(price)
+                    .ok_or(Error::ArithmeticOverflow)
             }
-            let precision_sq = PRICE_PRECISION
-                .checked_mul(PRICE_PRECISION)
-                .ok_or(Error::ArithmeticOverflow)?;
-            let inverted = precision_sq
-                .checked_div(price)
-                .ok_or(Error::ArithmeticOverflow)?;
-            return Ok(inverted);
+            Err(reverse_err) => {
+                if direct_err == Error::OracleStalePrice || reverse_err == Error::OracleStalePrice {
+                    Err(Error::OracleStalePrice)
+                } else {
+                    Err(Error::PriceNotFound)
+                }
+            }
         }
-
-        Err(Error::PriceNotFound)
     }
 
-    /// Sets the price for a pair identified by `Symbol` (e.g. XLM/USDC).
+    /// Submit a price report for a symbol pair (e.g. XLM/USDC).
+    ///
+    /// Uses the same five-reporter / 15-minute median policy as Address pairs.
     pub fn set_price_symbol(
         env: Env,
         caller: Address,
@@ -899,49 +934,58 @@ impl TwapOracle {
         if price == 0 {
             return Err(Error::InvalidPrice);
         }
+
         bump_instance(&env);
+        add_symbol_pair_reporter(&env, &base, &quote, &caller)?;
+
+        let data = PairPriceData {
+            price,
+            updated_at: env.ledger().timestamp(),
+        };
+        let submission_key =
+            DataKey::PairSymbolSubmission(base.clone(), quote.clone(), caller.clone());
+        env.storage().persistent().set(&submission_key, &data);
+        ttl::bump_persistent(&env, &submission_key);
+
         env.storage()
             .instance()
             .set(&DataKey::PairPriceSymbol(base, quote), &price);
         Ok(())
     }
 
-    /// Fetches the direct price for a symbol pair.
+    /// Returns the decentralized median price for a symbol pair.
     pub fn get_price_symbol(env: Env, base: Symbol, quote: Symbol) -> Result<u128, Error> {
-        env.storage()
-            .instance()
-            .get(&DataKey::PairPriceSymbol(base, quote))
-            .ok_or(Error::PriceNotFound)
+        aggregate_symbol_pair_price(&env, &base, &quote)
     }
 
-    /// Fetches the inverted price for a symbol pair.
+    /// Fetches the direct symbol-pair median, or the reciprocal reverse-pair median.
     pub fn get_price_inverted_symbol(env: Env, base: Symbol, quote: Symbol) -> Result<u128, Error> {
-        if let Some(price) = env
-            .storage()
-            .instance()
-            .get::<_, u128>(&DataKey::PairPriceSymbol(base.clone(), quote.clone()))
-        {
-            return Ok(price);
-        }
+        let direct_err = match aggregate_symbol_pair_price(&env, &base, &quote) {
+            Ok(price) => return Ok(price),
+            Err(err @ Error::PriceNotFound) | Err(err @ Error::OracleStalePrice) => err,
+            Err(err) => return Err(err),
+        };
 
-        if let Some(price) = env
-            .storage()
-            .instance()
-            .get::<_, u128>(&DataKey::PairPriceSymbol(quote, base))
-        {
-            if price == 0 {
-                return Err(Error::InvalidPrice);
+        match aggregate_symbol_pair_price(&env, &quote, &base) {
+            Ok(price) => {
+                if price == 0 {
+                    return Err(Error::InvalidPrice);
+                }
+                let precision_sq = PRICE_PRECISION
+                    .checked_mul(PRICE_PRECISION)
+                    .ok_or(Error::ArithmeticOverflow)?;
+                precision_sq
+                    .checked_div(price)
+                    .ok_or(Error::ArithmeticOverflow)
             }
-            let precision_sq = PRICE_PRECISION
-                .checked_mul(PRICE_PRECISION)
-                .ok_or(Error::ArithmeticOverflow)?;
-            let inverted = precision_sq
-                .checked_div(price)
-                .ok_or(Error::ArithmeticOverflow)?;
-            return Ok(inverted);
+            Err(reverse_err) => {
+                if direct_err == Error::OracleStalePrice || reverse_err == Error::OracleStalePrice {
+                    Err(Error::OracleStalePrice)
+                } else {
+                    Err(Error::PriceNotFound)
+                }
+            }
         }
-
-        Err(Error::PriceNotFound)
     }
 
     // ── Emergency pause (Pauser or Admin-gated) ──────────────────────────
@@ -1059,6 +1103,206 @@ fn store_oracle_config(env: &Env, caller: &Address, config: OracleConfig) -> Res
     env.storage().instance().set(&DataKey::Config, &config);
     events::oracle_configured(env, caller, config);
     Ok(())
+}
+
+
+/// True while a reporter may contribute to pair-price aggregation.
+fn is_authorized_pair_reporter(env: &Env, reporter: &Address) -> bool {
+    has_role(env, Role::PriceFeeder, reporter) || has_role(env, Role::Admin, reporter)
+}
+
+fn add_pair_reporter(
+    env: &Env,
+    base: &Address,
+    quote: &Address,
+    reporter: &Address,
+) -> Result<(), Error> {
+    let key = DataKey::PairReporters(base.clone(), quote.clone());
+    let existing: Vec<Address> = env
+        .storage()
+        .persistent()
+        .get(&key)
+        .unwrap_or(Vec::new(env));
+
+    let mut active = Vec::new(env);
+    let mut already_present = false;
+    for account in existing.iter() {
+        if is_authorized_pair_reporter(env, &account) {
+            if account == *reporter {
+                already_present = true;
+            }
+            active.push_back(account);
+        }
+    }
+
+    if !already_present {
+        if active.len() >= MAX_PAIR_REPORTERS {
+            return Err(Error::TooManyPairReporters);
+        }
+        active.push_back(reporter.clone());
+    }
+
+    env.storage().persistent().set(&key, &active);
+    ttl::bump_persistent(env, &key);
+    Ok(())
+}
+
+fn add_symbol_pair_reporter(
+    env: &Env,
+    base: &Symbol,
+    quote: &Symbol,
+    reporter: &Address,
+) -> Result<(), Error> {
+    let key = DataKey::PairSymbolReporters(base.clone(), quote.clone());
+    let existing: Vec<Address> = env
+        .storage()
+        .persistent()
+        .get(&key)
+        .unwrap_or(Vec::new(env));
+
+    let mut active = Vec::new(env);
+    let mut already_present = false;
+    for account in existing.iter() {
+        if is_authorized_pair_reporter(env, &account) {
+            if account == *reporter {
+                already_present = true;
+            }
+            active.push_back(account);
+        }
+    }
+
+    if !already_present {
+        if active.len() >= MAX_PAIR_REPORTERS {
+            return Err(Error::TooManyPairReporters);
+        }
+        active.push_back(reporter.clone());
+    }
+
+    env.storage().persistent().set(&key, &active);
+    ttl::bump_persistent(env, &key);
+    Ok(())
+}
+
+fn aggregate_pair_price(env: &Env, base: &Address, quote: &Address) -> Result<u128, Error> {
+    let reporters_key = DataKey::PairReporters(base.clone(), quote.clone());
+    let reporters: Vec<Address> = env
+        .storage()
+        .persistent()
+        .get(&reporters_key)
+        .unwrap_or(Vec::new(env));
+
+    // Upgrade compatibility for feeds written before pair aggregation existed.
+    if reporters.is_empty() {
+        return env
+            .storage()
+            .instance()
+            .get(&DataKey::PairPrice(base.clone(), quote.clone()))
+            .ok_or(Error::PriceNotFound);
+    }
+
+    let now = env.ledger().timestamp();
+    let mut fresh = Vec::new(env);
+    let mut saw_authorized_submission = false;
+
+    for reporter in reporters.iter() {
+        if !is_authorized_pair_reporter(env, &reporter) {
+            continue;
+        }
+        let key = DataKey::PairSubmission(base.clone(), quote.clone(), reporter);
+        if let Some(data) = env.storage().persistent().get::<_, PairPriceData>(&key) {
+            saw_authorized_submission = true;
+            if now.saturating_sub(data.updated_at) <= PAIR_REPORT_FRESHNESS_SECS {
+                fresh.push_back(data.price);
+            }
+        }
+    }
+
+    if fresh.is_empty() {
+        return if saw_authorized_submission {
+            Err(Error::OracleStalePrice)
+        } else {
+            Err(Error::PriceNotFound)
+        };
+    }
+
+    Ok(median_u128(fresh))
+}
+
+fn aggregate_symbol_pair_price(env: &Env, base: &Symbol, quote: &Symbol) -> Result<u128, Error> {
+    let reporters_key = DataKey::PairSymbolReporters(base.clone(), quote.clone());
+    let reporters: Vec<Address> = env
+        .storage()
+        .persistent()
+        .get(&reporters_key)
+        .unwrap_or(Vec::new(env));
+
+    if reporters.is_empty() {
+        return env
+            .storage()
+            .instance()
+            .get(&DataKey::PairPriceSymbol(base.clone(), quote.clone()))
+            .ok_or(Error::PriceNotFound);
+    }
+
+    let now = env.ledger().timestamp();
+    let mut fresh = Vec::new(env);
+    let mut saw_authorized_submission = false;
+
+    for reporter in reporters.iter() {
+        if !is_authorized_pair_reporter(env, &reporter) {
+            continue;
+        }
+        let key = DataKey::PairSymbolSubmission(base.clone(), quote.clone(), reporter);
+        if let Some(data) = env.storage().persistent().get::<_, PairPriceData>(&key) {
+            saw_authorized_submission = true;
+            if now.saturating_sub(data.updated_at) <= PAIR_REPORT_FRESHNESS_SECS {
+                fresh.push_back(data.price);
+            }
+        }
+    }
+
+    if fresh.is_empty() {
+        return if saw_authorized_submission {
+            Err(Error::OracleStalePrice)
+        } else {
+            Err(Error::PriceNotFound)
+        };
+    }
+
+    Ok(median_u128(fresh))
+}
+
+fn median_u128(values: Vec<u128>) -> u128 {
+    let len = values.len();
+    let mut sorted = values.clone();
+    let mut i: u32 = 1;
+    while i < len {
+        let key = sorted.get(i).unwrap();
+        let mut j = i;
+        while j > 0 {
+            let prev = sorted.get(j - 1).unwrap();
+            if prev <= key {
+                break;
+            }
+            sorted.set(j, prev);
+            j -= 1;
+        }
+        sorted.set(j, key);
+        i += 1;
+    }
+
+    let mid = len / 2;
+    if len & 1 == 0 {
+        let a = sorted.get(mid - 1).unwrap();
+        let b = sorted.get(mid).unwrap();
+        // Overflow-safe integer average. Avoid `a + b`, which can overflow
+        // for valid u128 prices even though their median is representable.
+        (a / 2)
+            .saturating_add(b / 2)
+            .saturating_add(((a % 2) + (b % 2)) / 2)
+    } else {
+        sorted.get(mid).unwrap()
+    }
 }
 
 // ── Internal RBAC helpers (delegate to drip_common::rbac) ─────────────────
@@ -3058,6 +3302,131 @@ mod tests {
             result.is_ok(),
             "first-ever submission must bypass the interval check"
         );
+    }
+
+    // ── Issue #695: decentralized pair-price aggregation ───────────────────
+
+    #[test]
+    fn pair_price_uses_median_of_fresh_authorized_reporters() {
+        let (env, client, admin) = setup();
+        client.initialize(&admin);
+
+        let base = Address::generate(&env);
+        let quote = Address::generate(&env);
+        let f1 = Address::generate(&env);
+        let f2 = Address::generate(&env);
+        let f3 = Address::generate(&env);
+
+        for feeder in [f1.clone(), f2.clone(), f3.clone()] {
+            client.grant_role(&admin, &Role::PriceFeeder, &feeder);
+        }
+
+        client.set_price(&f1, &base, &quote, &100u128);
+        client.set_price(&f2, &base, &quote, &300u128);
+        client.set_price(&f3, &base, &quote, &200u128);
+
+        assert_eq!(client.get_price(&base, &quote), 200u128);
+    }
+
+    #[test]
+    fn pair_price_ignores_stale_reports_and_errors_when_all_are_stale() {
+        let (env, client, admin) = setup();
+        client.initialize(&admin);
+
+        let base = Address::generate(&env);
+        let quote = Address::generate(&env);
+        let f1 = Address::generate(&env);
+        let f2 = Address::generate(&env);
+        client.grant_role(&admin, &Role::PriceFeeder, &f1);
+        client.grant_role(&admin, &Role::PriceFeeder, &f2);
+
+        env.ledger().set(LedgerInfo {
+            timestamp: 1_000_000,
+            protocol_version: 21,
+            sequence_number: 1,
+            network_id: Default::default(),
+            base_reserve: 10,
+            min_temp_entry_ttl: 16,
+            min_persistent_entry_ttl: 4096,
+            max_entry_ttl: 6_312_000,
+        });
+        client.set_price(&f1, &base, &quote, &100u128);
+
+        // f1 is now older than the 15-minute pair-report window.
+        env.ledger().set(LedgerInfo {
+            timestamp: 1_000_901,
+            protocol_version: 21,
+            sequence_number: 2,
+            network_id: Default::default(),
+            base_reserve: 10,
+            min_temp_entry_ttl: 16,
+            min_persistent_entry_ttl: 4096,
+            max_entry_ttl: 6_312_000,
+        });
+        client.set_price(&f2, &base, &quote, &250u128);
+        assert_eq!(client.get_price(&base, &quote), 250u128);
+
+        env.ledger().set(LedgerInfo {
+            timestamp: 1_001_802,
+            protocol_version: 21,
+            sequence_number: 3,
+            network_id: Default::default(),
+            base_reserve: 10,
+            min_temp_entry_ttl: 16,
+            min_persistent_entry_ttl: 4096,
+            max_entry_ttl: 6_312_000,
+        });
+        assert_eq!(
+            client.try_get_price(&base, &quote),
+            Err(Ok(Error::OracleStalePrice))
+        );
+    }
+
+    #[test]
+    fn pair_price_caps_active_reporters_at_five() {
+        let (env, client, admin) = setup();
+        client.initialize(&admin);
+
+        let base = Address::generate(&env);
+        let quote = Address::generate(&env);
+        let mut feeders = std::vec::Vec::new();
+
+        for _ in 0..6 {
+            let feeder = Address::generate(&env);
+            client.grant_role(&admin, &Role::PriceFeeder, &feeder);
+            feeders.push(feeder);
+        }
+
+        for feeder in feeders.iter().take(5) {
+            client.set_price(feeder, &base, &quote, &100u128);
+        }
+
+        assert_eq!(
+            client.try_set_price(&feeders[5], &base, &quote, &100u128),
+            Err(Ok(Error::TooManyPairReporters))
+        );
+    }
+
+    #[test]
+    fn symbol_pair_price_uses_the_same_median_policy() {
+        let (env, client, admin) = setup();
+        client.initialize(&admin);
+
+        let base = symbol_short!("XLM");
+        let quote = symbol_short!("USDC");
+        let f1 = Address::generate(&env);
+        let f2 = Address::generate(&env);
+        let f3 = Address::generate(&env);
+
+        for feeder in [f1.clone(), f2.clone(), f3.clone()] {
+            client.grant_role(&admin, &Role::PriceFeeder, &feeder);
+        }
+
+        client.set_price_symbol(&f1, &base, &quote, &20_000_000u128);
+        client.set_price_symbol(&f2, &base, &quote, &21_000_000u128);
+        client.set_price_symbol(&f3, &base, &quote, &19_000_000u128);
+
+        assert_eq!(client.get_price_symbol(&base, &quote), 20_000_000u128);
     }
 
     // ── Pair price and inverted price calculation tests ───────────────────
