@@ -152,8 +152,9 @@ pub fn owner_accepted(env: &Env, caller: &Address, old_owner: &Address) {
         .publish((symbol_short!("accept"), caller.clone()), old_owner.clone());
 }
 
-/// Emitted by `keep_alive` when the vault instance TTL is extended.
-pub fn kept_alive(env: &Env, extend_to: u32) {
-    env.events()
-        .publish((soroban_sdk::Symbol::new(env, "kept_alive"),), extend_to);
+pub fn owner_proposal_ttl_set(env: &Env, caller: &Address, old_ttl: u64, new_ttl: u64) {
+    env.events().publish(
+        (symbol_short!("owner_ttl"), caller.clone()),
+        (old_ttl, new_ttl),
+    );
 }
